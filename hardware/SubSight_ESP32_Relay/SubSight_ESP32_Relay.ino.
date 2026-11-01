@@ -1,0 +1,554 @@
+  #include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <math.h>
+#include <string.h>
+
+// ============================================================
+// SUBSIGHT ESP32 RELAY
+// MEDIAN FILTERING FOR ALL FOUR SENSOR VALUES
+// ============================================================
+
+// ESP-NOW configuration
+#define ESPNOW_CHANNEL 1
+
+// Gateway MAC - unchanged
+uint8_t GATEWAY_MAC[] = {
+  0x88, 0x57, 0x21, 0xB7, 0x7A, 0x08
+};
+
+// ============================================================
+// PACKET STRUCTURE - MUST MATCH ALL NODES AND GATEWAY
+// ============================================================
+
+typedef struct {
+  int node_id;
+  float pitch;
+  float roll;
+  float distance_cm;
+  float vibration_score;
+  uint8_t sos;
+} SensorData;
+
+// ============================================================
+// MEDIAN FILTER CONFIGURATION
+// ============================================================
+
+#define MAX_NODES 4
+#define FILTER_SIZE 5
+#define FILTER_RESET_MS 5000
+
+struct MedianBuffer {
+  float values[FILTER_SIZE];
+  int index;
+  int count;
+};
+
+struct NodeFilters {
+  MedianBuffer pitch;
+  MedianBuffer roll;
+  MedianBuffer distance;
+  MedianBuffer vibration;
+
+  unsigned long lastReceived;
+  bool active;
+};
+
+NodeFilters nodeFilters[MAX_NODES] = {};
+
+// ============================================================
+// INSERT READING INTO CIRCULAR BUFFER
+// ============================================================
+
+float medianFilter(
+  MedianBuffer &filter,
+  float newValue
+) {
+
+  // Do not add invalid measurements
+  if (!isfinite(newValue)) {
+    return NAN;
+  }
+
+  filter.values[filter.index] = newValue;
+
+  filter.index =
+    (filter.index + 1) % FILTER_SIZE;
+
+  if (filter.count < FILTER_SIZE) {
+    filter.count++;
+  }
+
+  // First four readings remain unfiltered
+  if (filter.count < FILTER_SIZE) {
+    return newValue;
+  }
+
+  float sorted[FILTER_SIZE];
+
+  for (int i = 0; i < FILTER_SIZE; i++) {
+    sorted[i] = filter.values[i];
+  }
+
+  // Sort readings in ascending order
+  for (int i = 0; i < FILTER_SIZE - 1; i++) {
+
+    for (int j = i + 1; j < FILTER_SIZE; j++) {
+
+      if (sorted[j] < sorted[i]) {
+
+        float temp = sorted[i];
+
+        sorted[i] = sorted[j];
+
+        sorted[j] = temp;
+      }
+    }
+  }
+
+  // Middle value = median
+  return sorted[2];
+}
+
+// ============================================================
+// RESET FILTERS AFTER LONG COMMUNICATION GAP
+// ============================================================
+
+void resetNodeFilters(int nodeIndex) {
+
+  memset(
+    &nodeFilters[nodeIndex],
+    0,
+    sizeof(NodeFilters)
+  );
+}
+
+// ============================================================
+// APPLY MEDIAN TO ALL SENSOR VALUES
+// ============================================================
+
+void applyMedianFilters(SensorData &packet) {
+
+  int nodeIndex = packet.node_id - 1;
+
+  if (nodeIndex < 0 || nodeIndex >= MAX_NODES) {
+    return;
+  }
+
+  NodeFilters &node = nodeFilters[nodeIndex];
+
+  unsigned long now = millis();
+
+  if (node.active &&
+      now - node.lastReceived > FILTER_RESET_MS) {
+
+    resetNodeFilters(nodeIndex);
+  }
+
+  // Reset may have cleared node state
+  node.active = true;
+  node.lastReceived = now;
+
+  // Keep original readings for diagnostics
+  float rawPitch = packet.pitch;
+  float rawRoll = packet.roll;
+  float rawDistance = packet.distance_cm;
+  float rawVibration = packet.vibration_score;
+
+  // Apply independent filters
+
+  packet.pitch = medianFilter(
+    node.pitch,
+    rawPitch
+  );
+
+  packet.roll = medianFilter(
+    node.roll,
+    rawRoll
+  );
+
+  packet.distance_cm = medianFilter(
+    node.distance,
+    rawDistance
+  );
+
+  packet.vibration_score = medianFilter(
+    node.vibration,
+    rawVibration
+  );
+
+  // SOS is intentionally NOT filtered
+  // packet.sos remains unchanged
+
+  Serial.println();
+  Serial.println("========== MEDIAN FILTER ==========");
+
+  Serial.print("NODE: ");
+  Serial.println(packet.node_id);
+
+  Serial.print("PITCH RAW: ");
+  Serial.print(rawPitch, 3);
+  Serial.print(" | FILTERED: ");
+  Serial.println(packet.pitch, 3);
+
+  Serial.print("ROLL RAW: ");
+  Serial.print(rawRoll, 3);
+  Serial.print(" | FILTERED: ");
+  Serial.println(packet.roll, 3);
+
+  Serial.print("DIST RAW: ");
+  Serial.print(rawDistance, 2);
+  Serial.print(" | FILTERED: ");
+  Serial.println(packet.distance_cm, 2);
+
+  Serial.print("VIB RAW: ");
+  Serial.print(rawVibration, 6);
+  Serial.print(" | FILTERED: ");
+  Serial.println(packet.vibration_score, 6);
+
+  Serial.print("SOS: ");
+  Serial.println(packet.sos);
+
+  Serial.println("===================================");
+}
+
+// ============================================================
+// RELAY QUEUE
+// ============================================================
+
+#define QUEUE_SIZE 32
+
+SensorData packetQueue[QUEUE_SIZE];
+
+int queueHead = 0;
+int queueTail = 0;
+int queueCount = 0;
+
+// Protect queue shared between callback and loop
+portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ============================================================
+// STATISTICS
+// ============================================================
+
+volatile unsigned long rxPackets = 0;
+volatile unsigned long malformedPackets = 0;
+volatile unsigned long forwardedPackets = 0;
+volatile unsigned long forwardFailed = 0;
+volatile unsigned long droppedPackets = 0;
+
+// ============================================================
+// ADD PACKET TO QUEUE
+// ============================================================
+
+bool enqueuePacket(const SensorData &packet) {
+
+  bool success = false;
+
+  portENTER_CRITICAL(&queueMux);
+
+  if (queueCount < QUEUE_SIZE) {
+
+    packetQueue[queueTail] = packet;
+
+    queueTail = (queueTail + 1) % QUEUE_SIZE;
+
+    queueCount++;
+
+    success = true;
+
+  } else {
+
+    droppedPackets++;
+  }
+
+  portEXIT_CRITICAL(&queueMux);
+
+  return success;
+}
+
+// ============================================================
+// REMOVE PACKET FROM QUEUE
+// ============================================================
+
+bool dequeuePacket(SensorData &packet) {
+
+  bool success = false;
+
+  portENTER_CRITICAL(&queueMux);
+
+  if (queueCount > 0) {
+
+    packet = packetQueue[queueHead];
+
+    queueHead = (queueHead + 1) % QUEUE_SIZE;
+
+    queueCount--;
+
+    success = true;
+  }
+
+  portEXIT_CRITICAL(&queueMux);
+
+  return success;
+}
+
+// ============================================================
+// ESP-NOW RECEIVE CALLBACK
+// ============================================================
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+void onDataRecv(
+  const esp_now_recv_info_t *info,
+  const uint8_t *incomingData,
+  int len
+) {
+
+#else
+
+void onDataRecv(
+  const uint8_t *mac,
+  const uint8_t *incomingData,
+  int len
+) {
+
+#endif
+
+  rxPackets++;
+
+  if (len != sizeof(SensorData)) {
+
+    malformedPackets++;
+    return;
+  }
+
+  SensorData receivedPacket;
+
+  memcpy(
+    &receivedPacket,
+    incomingData,
+    sizeof(SensorData)
+  );
+
+  if (
+    receivedPacket.node_id < 1 ||
+    receivedPacket.node_id > MAX_NODES
+  ) {
+    malformedPackets++;
+    return;
+  }
+
+  // Queue the original packet.
+  // Filtering runs in loop(), not in Wi-Fi callback.
+  enqueuePacket(receivedPacket);
+}
+
+// ============================================================
+// ESP-NOW SEND CALLBACK
+// ============================================================
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+void onDataSent(
+  const wifi_tx_info_t *info,
+  esp_now_send_status_t status
+) {
+
+#else
+
+void onDataSent(
+  const uint8_t *mac_addr,
+  esp_now_send_status_t status
+) {
+
+#endif
+
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    forwardedPackets++;
+  } else {
+    forwardFailed++;
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println("     SUBSIGHT ESP32 RELAY");
+  Serial.println("    ALL SENSOR MEDIAN FILTER");
+  Serial.println("==================================");
+
+  WiFi.mode(WIFI_STA);
+
+  Serial.print("[RELAY] MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  esp_err_t channelResult = esp_wifi_set_channel(
+    ESPNOW_CHANNEL,
+    WIFI_SECOND_CHAN_NONE
+  );
+
+  if (channelResult != ESP_OK) {
+    Serial.println("[RELAY] Channel configuration failed!");
+    while (true) delay(1000);
+  }
+
+  Serial.print("[RELAY] Channel: ");
+  Serial.println(ESPNOW_CHANNEL);
+
+  Serial.print("[RELAY] Packet size: ");
+  Serial.println(sizeof(SensorData));
+
+  if (sizeof(SensorData) != 24) {
+
+    Serial.println("[ERROR] Packet size mismatch!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+
+    Serial.println("[ERROR] ESP-NOW failed!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+  esp_now_register_send_cb(onDataSent);
+
+  // Register gateway
+  esp_now_peer_info_t gatewayPeer = {};
+
+  memcpy(
+    gatewayPeer.peer_addr,
+    GATEWAY_MAC,
+    6
+  );
+
+  gatewayPeer.channel = ESPNOW_CHANNEL;
+  gatewayPeer.encrypt = false;
+
+  if (!esp_now_is_peer_exist(GATEWAY_MAC)) {
+
+    esp_err_t result =
+      esp_now_add_peer(&gatewayPeer);
+
+    if (result != ESP_OK) {
+
+      Serial.print("[ERROR] Gateway registration: ");
+      Serial.println(result);
+
+      while (true) {
+        delay(1000);
+      }
+    }
+  }
+
+  Serial.println("[RELAY] Gateway registered");
+
+  // Initialize filters for each node
+  for (int i = 0; i < MAX_NODES; i++) {
+
+    resetNodeFilters(i);
+  }
+
+  Serial.println("[RELAY] Median window: 5");
+  Serial.println("[RELAY] Supported nodes: 1-4");
+  Serial.println("[RELAY] Filtering enabled");
+  Serial.println("[RELAY] READY");
+  Serial.println();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  SensorData packet;
+
+  // Process queued packets
+  if (dequeuePacket(packet)) {
+
+    Serial.print("[RELAY] Received Node ");
+    Serial.println(packet.node_id);
+
+    // Apply all four median filters
+    applyMedianFilters(packet);
+
+    // Forward filtered packet to gateway
+    esp_err_t result = esp_now_send(
+      GATEWAY_MAC,
+      (uint8_t *)&packet,
+      sizeof(packet)
+    );
+
+    if (result == ESP_OK) {
+
+      Serial.print("[RELAY] Queued forward Node ");
+      Serial.println(packet.node_id);
+
+    } else {
+
+      Serial.print("[RELAY] Send error: ");
+      Serial.println(result);
+
+      forwardFailed++;
+    }
+  }
+
+  // Statistics every 10 seconds
+  static unsigned long lastStats = 0;
+
+  if (millis() - lastStats >= 10000) {
+
+    lastStats = millis();
+
+    int currentQueueCount;
+
+    portENTER_CRITICAL(&queueMux);
+    currentQueueCount = queueCount;
+    portEXIT_CRITICAL(&queueMux);
+
+    Serial.println();
+    Serial.println("========= RELAY STATS =========");
+
+    Serial.print("RX packets: ");
+    Serial.println(rxPackets);
+
+    Serial.print("Malformed: ");
+    Serial.println(malformedPackets);
+
+    Serial.print("Forwarded: ");
+    Serial.println(forwardedPackets);
+
+    Serial.print("Failed: ");
+    Serial.println(forwardFailed);
+
+    Serial.print("Dropped: ");
+    Serial.println(droppedPackets);
+
+    Serial.print("Queue: ");
+    Serial.println(currentQueueCount);
+
+    Serial.print("Channel: ");
+    Serial.println(ESPNOW_CHANNEL);
+
+    Serial.println("===============================");
+  }
+
+  delay(1);
+}
